@@ -28,22 +28,36 @@
 #define GL_GLEXT_PROTOTYPES
 
 #include <gbm.h>
-#include "gl_wrap.h"
-#include <GL/glext.h>
+#include <GL/gl.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <drm.h>
+#include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
+#include <sys/select.h>
+
+#ifdef GL_OES_EGL_image
+static PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC glEGLImageTargetRenderbufferStorageOES_func;
+#endif
 
 struct kms {
    drmModeConnector *connector;
    drmModeEncoder *encoder;
    drmModeModeInfo mode;
-   uint32_t fb_id;
 };
+
+GLfloat x = 1.0;
+GLfloat y = 1.0;
+GLfloat xstep = 1.0f;
+GLfloat ystep = 1.0f;
+GLfloat rsize = 50;
+
+int quit = 0;
 
 static EGLBoolean
 setup_kms(int fd, struct kms *kms)
@@ -98,50 +112,29 @@ setup_kms(int fd, struct kms *kms)
 static void
 render_stuff(int width, int height)
 {
-   GLfloat view_rotx = 0.0, view_roty = 0.0, view_rotz = 0.0;
-   static const GLfloat verts[3][2] = {
-      { -1, -1 },
-      {  1, -1 },
-      {  0,  1 }
-   };
-   static const GLfloat colors[3][3] = {
-      { 1, 0, 0 },
-      { 0, 1, 0 },
-      { 0, 0, 1 }
-   };
-   GLfloat ar = (GLfloat) width / (GLfloat) height;
-
    glViewport(0, 0, (GLint) width, (GLint) height);
 
    glMatrixMode(GL_PROJECTION);
    glLoadIdentity();
-   glFrustum(-ar, ar, -1, 1, 5.0, 60.0);
+
+   glOrtho(0, width, 0, height, 1.0, -1.0);
 
    glMatrixMode(GL_MODELVIEW);
    glLoadIdentity();
-   glTranslatef(0.0, 0.0, -10.0);
 
-   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-   glClearColor(0.4, 0.4, 0.4, 0.0);
+   glClear(GL_COLOR_BUFFER_BIT);
+   glColor3f(1.0f, 0.0f, 0.0f);
 
-   glPushMatrix();
-   glRotatef(view_rotx, 1, 0, 0);
-   glRotatef(view_roty, 0, 1, 0);
-   glRotatef(view_rotz, 0, 0, 1);
+   glRectf(x, y, x + rsize, y + rsize);
 
-   glVertexPointer(2, GL_FLOAT, 0, verts);
-   glColorPointer(3, GL_FLOAT, 0, colors);
-   glEnableClientState(GL_VERTEX_ARRAY);
-   glEnableClientState(GL_COLOR_ARRAY);
+   if (x <= 0 || x >= width - rsize)
+     xstep *= -1;
 
-   glDrawArrays(GL_TRIANGLES, 0, 3);
+   if (y <= 0 || y >= height - rsize)
+     ystep *= -1;
 
-   glDisableClientState(GL_VERTEX_ARRAY);
-   glDisableClientState(GL_COLOR_ARRAY);
-
-   glPopMatrix();
-
-   glFinish();
+   x += xstep;
+   y += ystep;
 }
 
 static const char device_name[] = "/dev/dri/card0";
@@ -157,21 +150,47 @@ static const EGLint attribs[] = {
    EGL_NONE
 };
 
+void quit_handler(int signum)
+{
+  quit = 1;
+  printf("Quitting!\n");
+}
+
+uint32_t current_fb_id, next_fb_id;
+struct gbm_bo *current_bo, *next_bo;
+struct gbm_surface *gs;
+struct kms kms;
+
+static void
+page_flip_handler(int fd, unsigned int frame,
+		  unsigned int sec, unsigned int usec, void *data)
+{
+   if (current_fb_id)
+      drmModeRmFB(fd, current_fb_id);
+   current_fb_id = next_fb_id;
+   next_fb_id = 0;
+
+   if (current_bo)
+     gbm_surface_release_buffer(gs, current_bo);
+   current_bo = next_bo;
+   next_bo = NULL;
+}
+
 int main(int argc, char *argv[])
 {
    EGLDisplay dpy;
    EGLContext ctx;
-   EGLSurface surface;
    EGLConfig config;
+   EGLSurface surface;
    EGLint major, minor, n;
    const char *ver;
    uint32_t handle, stride;
-   struct kms kms;
-   int ret, fd;
+   int ret, fd, frames = 0;
    struct gbm_device *gbm;
-   struct gbm_bo *bo;
    drmModeCrtcPtr saved_crtc;
-   struct gbm_surface *gs;
+   time_t start, end;
+
+   signal (SIGINT, quit_handler);
 
    fd = open(device_name, O_RDWR);
    if (fd < 0) {
@@ -193,7 +212,7 @@ int main(int argc, char *argv[])
       ret = -1;
       goto destroy_gbm_device;
    }
-	
+
    if (!eglInitialize(dpy, &major, &minor)) {
       printf("eglInitialize() failed\n");
       ret = -1;
@@ -214,7 +233,7 @@ int main(int argc, char *argv[])
       fprintf(stderr, "failed to choose argb config\n");
       goto egl_terminate;
    }
-   
+
    ctx = eglCreateContext(dpy, config, EGL_NO_CONTEXT, NULL);
    if (ctx == NULL) {
       fprintf(stderr, "failed to create context\n");
@@ -225,59 +244,96 @@ int main(int argc, char *argv[])
    gs = gbm_surface_create(gbm, kms.mode.hdisplay, kms.mode.vdisplay,
 			   GBM_BO_FORMAT_XRGB8888,
 			   GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+   if (gs == NULL) {
+      fprintf(stderr, "unable to create gbm surface\n");
+      ret = -1;
+      goto egl_terminate;
+   }
+
    surface = eglCreateWindowSurface(dpy, config, gs, NULL);
+   if (surface == EGL_NO_SURFACE) {
+      fprintf(stderr, "failed to create surface\n");
+      ret = -1;
+      goto destroy_gbm_surface;
+   }
 
    if (!eglMakeCurrent(dpy, surface, surface, ctx)) {
       fprintf(stderr, "failed to make context current\n");
       ret = -1;
-      goto destroy_context;
-   }
-
-   render_stuff(kms.mode.hdisplay, kms.mode.vdisplay);
-
-   eglSwapBuffers(dpy, surface);
-
-   bo = gbm_surface_lock_front_buffer(gs);
-   handle = gbm_bo_get_handle(bo).u32;
-   stride = gbm_bo_get_stride(bo);
-
-   printf("handle=%d, stride=%d\n", handle, stride);
-
-   ret = drmModeAddFB(fd,
-		      kms.mode.hdisplay, kms.mode.vdisplay,
-		      24, 32, stride, handle, &kms.fb_id);
-   if (ret) {
-      fprintf(stderr, "failed to create fb\n");
-      goto rm_fb;
+      goto destroy_surface;
    }
 
    saved_crtc = drmModeGetCrtc(fd, kms.encoder->crtc_id);
    if (saved_crtc == NULL)
-      goto rm_fb;
+      goto destroy_context;
 
-   ret = drmModeSetCrtc(fd, kms.encoder->crtc_id, kms.fb_id, 0, 0,
-			&kms.connector->connector_id, 1, &kms.mode);
-   if (ret) {
-      fprintf(stderr, "failed to set mode: %m\n");
-      goto free_saved_crtc;
-   }
+   time(&start);
+   do {
+      drmEventContext evctx;
+      fd_set rfds;
 
-   getchar();
+      render_stuff(kms.mode.hdisplay, kms.mode.vdisplay);
+      eglSwapBuffers(dpy, surface);
 
-   ret = drmModeSetCrtc(fd, saved_crtc->crtc_id, saved_crtc->buffer_id,
-                        saved_crtc->x, saved_crtc->y,
-                        &kms.connector->connector_id, 1, &saved_crtc->mode);
-   if (ret) {
-      fprintf(stderr, "failed to restore crtc: %m\n");
-   }
+      if (!gbm_surface_has_free_buffers(gs))
+         fprintf(stderr, "out of free buffers\n");
 
-free_saved_crtc:
+      next_bo = gbm_surface_lock_front_buffer(gs);
+      if (!next_bo)
+         fprintf(stderr, "failed to lock front buffer: %m\n");
+      handle = gbm_bo_get_handle(next_bo).u32;
+      stride = gbm_bo_get_stride(next_bo);
+
+      ret = drmModeAddFB(fd,
+			 kms.mode.hdisplay, kms.mode.vdisplay,
+			 24, 32, stride, handle, &next_fb_id);
+      if (ret) {
+         fprintf(stderr, "failed to create fb\n");
+	 goto out;
+      }
+
+      ret = drmModePageFlip(fd, kms.encoder->crtc_id,
+			    next_fb_id,
+			    DRM_MODE_PAGE_FLIP_EVENT, 0);
+      if (ret) {
+         fprintf(stderr, "failed to page flip: %m\n");
+	 goto out;
+      }
+
+      FD_ZERO(&rfds);
+      FD_SET(fd, &rfds);
+
+      while (select(fd + 1, &rfds, NULL, NULL, NULL) == -1)
+	NULL;
+
+      memset(&evctx, 0, sizeof evctx);
+      evctx.version = DRM_EVENT_CONTEXT_VERSION;
+      evctx.page_flip_handler = page_flip_handler;
+
+      drmHandleEvent(fd, &evctx);
+
+      frames++;
+   } while (!quit);
+   time(&end);
+
+   printf("Frames per second: %.2lf\n", frames / difftime(end, start));
+
+out:
+   drmModeSetCrtc(fd, saved_crtc->crtc_id, saved_crtc->buffer_id,
+		  saved_crtc->x, saved_crtc->y,
+		  &kms.connector->connector_id, 1, &saved_crtc->mode);
    drmModeFreeCrtc(saved_crtc);
-rm_fb:
-   drmModeRmFB(fd, kms.fb_id);
+   if (current_fb_id)
+      drmModeRmFB(fd, current_fb_id);
+   if (next_fb_id)
+      drmModeRmFB(fd, next_fb_id);
    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 destroy_context:
    eglDestroyContext(dpy, ctx);
+destroy_surface:
+   eglDestroySurface(dpy, surface);
+destroy_gbm_surface:
+   gbm_surface_destroy(gs);
 egl_terminate:
    eglTerminate(dpy);
 destroy_gbm_device:
